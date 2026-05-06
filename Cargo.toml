@@ -1,0 +1,38 @@
+[package]
+name = "agentsh"
+version = "0.1.0"
+edition = "2021"
+description = "Make any terminal agentic with local LLMs"
+license = "MIT"
+repository = "https://github.com/YOUR_USERNAME/agentsh"
+keywords = ["terminal", "llm", "agent", "ollama", "cli"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "agentsh"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "1"
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+dirs = "5"
+ratatui = "0.27"
+crossterm = "0.27"
+rusqlite = { version = "0.31", features = ["bundled"] }
+regex = "1"
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+mockito = "1"
+tokio-test = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
