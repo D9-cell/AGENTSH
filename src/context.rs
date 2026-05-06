@@ -12,16 +12,29 @@ pub use crate::history::Turn;
 
 const CWD_SENTINEL: &str = "__AGENTSH_CWD__=";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PermissionMode {
+    PerPlan,
+    AutoApprove { countdown_secs: u8 },
+}
+
 pub struct Context {
     pub cwd: PathBuf,
     pub env: HashMap<String, String>,
     pub scrollback: ScrollbackBuffer,
     pub turn_history: Vec<Turn>,
+    pub permission_mode: PermissionMode,
 }
 
 pub struct ScrollbackBuffer {
     lines: VecDeque<String>,
     max_lines: usize,
+}
+
+pub struct PassthroughResult {
+    pub output: String,
+    pub exit_code: Option<i32>,
+    pub interactive: bool,
 }
 
 impl Context {
@@ -34,6 +47,7 @@ impl Context {
             env,
             scrollback: ScrollbackBuffer::new(max_lines),
             turn_history,
+            permission_mode: PermissionMode::PerPlan,
         })
     }
 
@@ -90,10 +104,14 @@ impl ScrollbackBuffer {
     }
 }
 
-pub async fn run_passthrough(command: &str, context: &mut Context) -> Result<()> {
+pub async fn run_passthrough(command: &str, context: &mut Context) -> Result<PassthroughResult> {
     let trimmed = command.trim();
     if trimmed.is_empty() {
-        return Ok(());
+        return Ok(PassthroughResult {
+            output: String::new(),
+            exit_code: Some(0),
+            interactive: false,
+        });
     }
 
     std::env::set_current_dir(&context.cwd)
@@ -107,13 +125,17 @@ pub async fn run_passthrough(command: &str, context: &mut Context) -> Result<()>
             .stderr(Stdio::inherit())
             .spawn()
             .with_context(|| format!("failed to spawn passthrough command: {trimmed}"))?;
-        child
+        let status = child
             .wait()
             .await
             .context("failed while waiting for passthrough command")?;
         context.scrollback.push_line("[interactive command completed]");
         context.cwd = std::env::current_dir().context("failed to sync current directory")?;
-        return Ok(());
+        return Ok(PassthroughResult {
+            output: "[interactive command completed]".to_string(),
+            exit_code: status.code(),
+            interactive: true,
+        });
     }
 
     let mut child = build_passthrough_command(trimmed, &context.cwd)?
@@ -136,23 +158,26 @@ pub async fn run_passthrough(command: &str, context: &mut Context) -> Result<()>
     });
 
     let mut updated_cwd = None;
+    let mut output = String::new();
     while let Some((is_stderr, line)) = receiver.recv().await {
         if let Some(path) = line.strip_prefix(CWD_SENTINEL) {
             updated_cwd = Some(PathBuf::from(path.trim()));
             continue;
         }
 
-        if is_stderr {
-            eprintln!("{line}");
-        } else {
-            println!("{line}");
+        if !output.is_empty() {
+            output.push('\n');
         }
-        let _ = io::stdout().flush();
-        let _ = io::stderr().flush();
+        output.push_str(&line);
+        if is_stderr {
+            let _ = io::stderr().flush();
+        } else {
+            let _ = io::stdout().flush();
+        }
         context.scrollback.push_line(line);
     }
 
-    child
+    let status = child
         .wait()
         .await
         .context("failed while waiting for passthrough command")?;
@@ -166,7 +191,11 @@ pub async fn run_passthrough(command: &str, context: &mut Context) -> Result<()>
         }
     }
     context.cwd = std::env::current_dir().context("failed to sync current directory")?;
-    Ok(())
+    Ok(PassthroughResult {
+        output,
+        exit_code: status.code(),
+        interactive: false,
+    })
 }
 
 async fn read_stream<R>(

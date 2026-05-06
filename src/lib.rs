@@ -1,10 +1,16 @@
 pub mod agent;
+pub mod banner;
+pub mod blocks;
 pub mod config;
 pub mod context;
 pub mod history;
+pub mod llm_setup;
 pub mod llm;
 pub mod parser;
 pub mod prompt_ui;
 pub mod repl;
 pub mod safety;
+pub mod shell_rc;
+pub mod spinner;
+pub mod suggest;
 pub mod tools;

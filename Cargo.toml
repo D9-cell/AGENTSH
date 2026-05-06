@@ -1,11 +1,11 @@
 [package]
 name = "agentsh"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
-description = "Make any terminal agentic with local LLMs"
+description = "Make any terminal agentic — smart LLM detection, autocomplete, natural language, auto-activation"
 license = "MIT"
-repository = "https://github.com/YOUR_USERNAME/agentsh"
-keywords = ["terminal", "llm", "agent", "ollama", "cli"]
+repository = "https://github.com/D9-cell/AGENTSH"
+keywords = ["terminal", "llm", "agent", "ollama", "autocomplete"]
 categories = ["command-line-utilities"]
 
 [[bin]]
@@ -27,6 +27,7 @@ crossterm = "0.27"
 rusqlite = { version = "0.31", features = ["bundled"] }
 regex = "1"
 chrono = { version = "0.4", features = ["serde"] }
+unicode-width = "0.1"
 
 [dev-dependencies]
 mockito = "1"

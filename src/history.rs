@@ -87,6 +87,33 @@ impl HistoryDb {
         Ok(turns)
     }
 
+    pub fn all_commands(&self) -> Result<Vec<String>> {
+        let mut statement = self.conn.prepare(
+            "SELECT commands
+             FROM turns
+             ORDER BY id DESC",
+        )?;
+
+        let rows = statement.query_map([], |row| {
+            let commands = row.get::<_, Option<String>>(0)?.unwrap_or_default();
+            let planned_commands = serde_json::from_str::<Vec<String>>(&commands).map_err(|err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    commands.len(),
+                    rusqlite::types::Type::Text,
+                    Box::new(err),
+                )
+            })?;
+            Ok(planned_commands)
+        })?;
+
+        let mut commands = Vec::new();
+        for row in rows {
+            commands.extend(row?);
+        }
+
+        Ok(commands)
+    }
+
     fn init_schema(&self) -> Result<()> {
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS turns (
@@ -137,6 +164,33 @@ mod tests {
 
         let recent = db.recent(1).unwrap();
         assert_eq!(recent, vec![turn]);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn flattens_all_commands_in_recent_first_order() {
+        let path = unique_temp_db_path("history-all-commands").unwrap();
+        let db = HistoryDb::open_at(path.clone()).unwrap();
+
+        db.insert_turn(&Turn {
+            user_input: "first".to_string(),
+            planned_commands: vec!["git status".to_string()],
+            executed: true,
+            explanation: String::new(),
+        })
+        .unwrap();
+
+        db.insert_turn(&Turn {
+            user_input: "second".to_string(),
+            planned_commands: vec!["cargo test".to_string(), "cargo clippy".to_string()],
+            executed: true,
+            explanation: String::new(),
+        })
+        .unwrap();
+
+        let commands = db.all_commands().unwrap();
+        assert_eq!(commands, vec!["cargo test", "cargo clippy", "git status"]);
 
         let _ = fs::remove_file(path);
     }

@@ -42,6 +42,7 @@ pub struct ToolExecution {
     pub output: String,
     pub exit_code: Option<i32>,
     pub updated_cwd: Option<PathBuf>,
+    pub interrupted: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -223,6 +224,7 @@ pub async fn execute_in_dir(name: &str, args: &Value, current_cwd: Option<&Path>
                 output: truncate_lines(&contents, parsed.max_lines.unwrap_or(200) as usize),
                 exit_code: Some(0),
                 updated_cwd: None,
+                interrupted: false,
             })
         }
         "file_write" => {
@@ -241,6 +243,7 @@ pub async fn execute_in_dir(name: &str, args: &Value, current_cwd: Option<&Path>
                 output: format!("Wrote {}", path.display()),
                 exit_code: Some(0),
                 updated_cwd: None,
+                interrupted: false,
             })
         }
         "git_status" => run_shell_command("git status --short", &cwd).await,
@@ -276,19 +279,27 @@ async fn run_shell_command(command: &str, cwd: &Path) -> Result<ToolExecution> {
             continue;
         }
 
-        if is_stderr {
-            eprintln!("{line}");
-        } else {
-            println!("{line}");
-        }
-        let _ = io::stdout().flush();
-        let _ = io::stderr().flush();
-
         output.push_str(&line);
         output.push('\n');
+
+        if is_stderr {
+            let _ = io::stderr().flush();
+        } else {
+            let _ = io::stdout().flush();
+        }
     }
 
-    let status = child.wait().await.context("failed to wait for command")?;
+    let (status, interrupted) = tokio::select! {
+        status = child.wait() => (status.context("failed to wait for command")?, false),
+        _ = tokio::signal::ctrl_c() => {
+            let _ = child.kill().await;
+            let status = child.wait().await.context("failed to wait for cancelled command")?;
+            if output.trim().is_empty() {
+                output.push_str("Mission cancelled.");
+            }
+            (status, true)
+        }
+    };
     stdout_task.await.context("stdout reader task failed")??;
     stderr_task.await.context("stderr reader task failed")??;
 
@@ -296,6 +307,7 @@ async fn run_shell_command(command: &str, cwd: &Path) -> Result<ToolExecution> {
         output,
         exit_code: status.code(),
         updated_cwd,
+        interrupted,
     })
 }
 

@@ -1,11 +1,15 @@
+use std::time::Instant;
+
 use anyhow::{Context as AnyhowContext, Result};
 use serde_json::Value;
 
+use crate::blocks;
 use crate::config::Config;
-use crate::context::{Context, Turn};
+use crate::context::{Context, PermissionMode, Turn};
 use crate::llm::{ChatMessage, LlmClient};
 use crate::prompt_ui;
 use crate::safety::RiskLevel;
+use crate::spinner::Spinner;
 use crate::tools::{self, PlannedCommand};
 
 #[derive(Debug, Clone)]
@@ -22,9 +26,14 @@ pub async fn handle(
     llm: &LlmClient,
 ) -> Result<()> {
     let messages = build_messages(user_input, config, context);
+    let spinner = Spinner::start("Planning...");
     let plan_message = match llm.plan(messages.clone(), &tools::all_schemas()).await {
-        Ok(message) => message,
+        Ok(message) => {
+            spinner.stop();
+            message
+        }
         Err(error) => {
+            spinner.stop();
             prompt_ui::print_text(&format!("[LLM error] {error}"));
             return Ok(());
         }
@@ -68,7 +77,7 @@ pub async fn handle(
     let planned_commands = build_planned_commands(&selected_tool_calls, context).await?;
     let approved = should_auto_approve(config, &planned_commands)
         || (!config.safety.require_confirm)
-        || prompt_ui::show_permission_panel(&planned_commands);
+        || prompt_ui::show_permission_panel(&planned_commands, &context.permission_mode);
 
     if !approved {
         prompt_ui::print_text("Cancelled.");
@@ -86,6 +95,7 @@ pub async fn handle(
 
     let mut execution_results = Vec::new();
     for command in &planned_commands {
+        let started = Instant::now();
         let result = match tools::execute_in_dir(&command.tool_name, &command.args, Some(&context.cwd)).await {
             Ok(result) => result,
             Err(error) => {
@@ -110,6 +120,28 @@ pub async fn handle(
             }
         }
         context.scrollback.push_text(&result.output);
+        blocks::print_command_block(
+            &command.display_text,
+            &result.output,
+            result.exit_code,
+            started.elapsed(),
+        )?;
+
+        if result.interrupted {
+            prompt_ui::print_text("Mission cancelled.");
+            context.permission_mode = PermissionMode::PerPlan;
+            context.record_turn(Turn {
+                user_input: user_input.to_string(),
+                planned_commands: planned_commands
+                    .iter()
+                    .map(|planned| planned.display_text.clone())
+                    .collect(),
+                executed: false,
+                explanation: "Mission cancelled.".to_string(),
+            });
+            return Ok(());
+        }
+
         execution_results.push(ExecutionResult {
             command: command.clone(),
             output: result.output,
