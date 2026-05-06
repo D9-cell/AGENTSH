@@ -12,13 +12,11 @@ pub fn print_startup_banner(model: &str, runtime_name: &str, connected: bool) ->
 
     let mut stdout = io::stdout();
     let art = [
-        "  ╔══════════════════════════════════════════════════════════════════════════╗",
-        "  ║   █████╗  ██████╗ ███████╗███╗   ██╗████████╗███████╗██╗  ██╗          ║",
-        "  ║  ██╔══██╗██╔════╝ ██╔════╝████╗  ██║╚══██╔══╝██╔════╝██║  ██║          ║",
-        "  ║  ███████║██║  ███╗█████╗  ██╔██╗ ██║   ██║   ███████╗███████║          ║",
-        "  ║  ██╔══██║██║   ██║██╔══╝  ██║╚██╗██║   ██║   ╚════██║██╔══██║          ║",
-        "  ║  ██║  ██║╚██████╔╝███████╗██║ ╚████║   ██║   ███████║██║  ██║          ║",
-        "  ╚══════════════════════════════════════════════════════════════════════════╝",
+        "  ╭──────────────────────────────────────────────────────────────╮",
+        "  │   █████╗  ██████╗ ███████╗███╗   ██╗████████╗███████╗██╗  ██╗ │",
+        "  │  ██╔══██╗██╔════╝ ██╔════╝████╗  ██║╚══██╔══╝██╔════╝██║  ██║ │",
+        "  │  ███████║██║  ███╗█████╗  ██╔██╗ ██║   ██║   ███████╗███████║ │",
+        "  ╰──────────────────────────────────────────────────────────────╯",
     ];
 
     for (index, line) in art.iter().enumerate() {
@@ -31,15 +29,18 @@ pub fn print_startup_banner(model: &str, runtime_name: &str, connected: bool) ->
         )?;
     }
 
-    let status = if connected { "connected ✓" } else { "not detected" };
+    let status = if connected { "connected" } else { "offline" };
     execute!(
         stdout,
         SetAttribute(Attribute::Bold),
+        SetForegroundColor(Color::Rgb { r: 226, g: 232, b: 240 }),
         Print("     Agentic terminal · powered by local LLM\n"),
+        ResetColor,
         SetAttribute(Attribute::Reset),
-        Print(format!("     Model: {model}  ·  {runtime_name}: {status}\n")),
-        Print("     Type naturally or use shell commands directly.\n"),
-        Print("     --allow-all  to enable full-permission mode\n\n")
+        SetForegroundColor(Color::Rgb { r: 148, g: 163, b: 184 }),
+        Print(format!("     {}  ·  {}  ·  model {}\n", runtime_name, status, model)),
+        Print("     Natural language, shell commands, and full-session auto-approve are ready.\n\n"),
+        ResetColor
     )?;
     stdout.flush()?;
 

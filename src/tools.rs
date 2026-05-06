@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{anyhow, Context, Result};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::fs;
@@ -151,7 +152,7 @@ pub fn describe_tool_call(name: &str, args: &Value) -> Result<String> {
     match name {
         "bash_exec" => {
             let parsed: BashExecArgs = serde_json::from_value(args.clone())?;
-            Ok(parsed.command)
+            Ok(normalize_shell_command(&parsed.command))
         }
         "file_read" => {
             let parsed: FileReadArgs = serde_json::from_value(args.clone())?;
@@ -207,12 +208,13 @@ pub async fn execute_in_dir(name: &str, args: &Value, current_cwd: Option<&Path>
     match name {
         "bash_exec" => {
             let parsed: BashExecArgs = serde_json::from_value(args.clone())?;
+            let normalized_command = normalize_shell_command(&parsed.command);
             let command_cwd = parsed
                 .cwd
                 .as_deref()
                 .map(|dir| resolve_path(&cwd, dir))
                 .unwrap_or(cwd);
-            run_shell_command(&parsed.command, &command_cwd).await
+            run_shell_command(&normalized_command, &command_cwd).await
         }
         "file_read" => {
             let parsed: FileReadArgs = serde_json::from_value(args.clone())?;
@@ -347,6 +349,100 @@ fn build_shell_command(command: &str, cwd: &Path) -> Result<Command> {
         let mut cmd = Command::new(shell);
         cmd.arg("-c").arg(wrapped).current_dir(cwd);
         Ok(cmd)
+    }
+}
+
+fn normalize_shell_command(command: &str) -> String {
+    if !command.contains("docker-compose") {
+        return command.to_string();
+    }
+
+    if command_in_path("docker-compose") || !command_in_path("docker") {
+        return command.to_string();
+    }
+
+    Regex::new(r"\bdocker-compose\b")
+        .map(|regex| regex.replace_all(command, "docker compose").to_string())
+        .unwrap_or_else(|_| command.to_string())
+}
+
+fn command_in_path(command: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| {
+            std::env::split_paths(&paths)
+                .map(|path| path.join(command))
+                .any(|candidate| candidate.is_file())
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::normalize_shell_command;
+
+    #[test]
+    fn replaces_docker_compose_when_only_docker_exists() {
+        let temp_dir = unique_temp_dir();
+        fs::create_dir_all(&temp_dir).unwrap();
+        fs::write(temp_dir.join("docker"), "#!/bin/sh\n").unwrap();
+
+        with_path(vec![temp_dir.clone()], || {
+            assert_eq!(
+                normalize_shell_command("docker-compose up --build"),
+                "docker compose up --build"
+            );
+        });
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn keeps_docker_compose_when_binary_exists() {
+        let temp_dir = unique_temp_dir();
+        fs::create_dir_all(&temp_dir).unwrap();
+        fs::write(temp_dir.join("docker"), "#!/bin/sh\n").unwrap();
+        fs::write(temp_dir.join("docker-compose"), "#!/bin/sh\n").unwrap();
+
+        with_path(vec![temp_dir.clone()], || {
+            assert_eq!(normalize_shell_command("docker-compose up"), "docker-compose up");
+        });
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    fn with_path<F>(paths: Vec<PathBuf>, test: F)
+    where
+        F: FnOnce(),
+    {
+        let guard = path_test_lock().lock().unwrap();
+        let original = std::env::var_os("PATH");
+        let joined = std::env::join_paths(paths).unwrap();
+        std::env::set_var("PATH", &joined);
+        test();
+        match original {
+            Some(value) => std::env::set_var("PATH", value),
+            None => std::env::remove_var("PATH"),
+        }
+        drop(guard);
+    }
+
+    fn path_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn unique_temp_dir() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(OsString::from(format!("agentsh-tools-{nanos}")))
     }
 }
 

@@ -121,20 +121,34 @@ async fn print_prompt(context: &Context) -> Result<()> {
     let path_segment = shorten_cwd(&context.cwd);
     let git_segment = git_prompt_segment(&context.cwd).await;
 
+    execute!(stdout, SetForegroundColor(Color::Rgb { r: 71, g: 85, b: 105 }), Print("\n• "))?;
+
     execute!(
         stdout,
-        SetBackgroundColor(Color::Rgb { r: 30, g: 33, b: 39 }),
-        SetForegroundColor(Color::White),
+        SetBackgroundColor(Color::Rgb { r: 30, g: 41, b: 59 }),
+        SetForegroundColor(Color::Rgb { r: 241, g: 245, b: 249 }),
         Print(format!(" {path_segment} ")),
+        SetForegroundColor(Color::Rgb { r: 30, g: 41, b: 59 }),
+        Print(""),
         ResetColor,
     )?;
 
     if let Some((branch, dirty)) = git_segment {
         execute!(
             stdout,
-            SetBackgroundColor(if dirty { Color::DarkYellow } else { Color::DarkGreen }),
+            SetBackgroundColor(if dirty {
+                Color::Rgb { r: 217, g: 119, b: 6 }
+            } else {
+                Color::Rgb { r: 5, g: 150, b: 105 }
+            }),
             SetForegroundColor(Color::Black),
             Print(format!(" {branch} {} ", if dirty { "±" } else { "✓" })),
+            SetForegroundColor(if dirty {
+                Color::Rgb { r: 217, g: 119, b: 6 }
+            } else {
+                Color::Rgb { r: 5, g: 150, b: 105 }
+            }),
+            Print(""),
             ResetColor,
         )?;
     }
@@ -142,18 +156,20 @@ async fn print_prompt(context: &Context) -> Result<()> {
     if matches!(context.permission_mode, PermissionMode::AutoApprove { .. }) {
         execute!(
             stdout,
-            SetBackgroundColor(Color::DarkYellow),
+            SetBackgroundColor(Color::Rgb { r: 251, g: 191, b: 36 }),
             SetForegroundColor(Color::Black),
             Print(" [AUTO] "),
+            SetForegroundColor(Color::Rgb { r: 251, g: 191, b: 36 }),
+            Print(""),
             ResetColor,
         )?;
     }
 
     execute!(
         stdout,
-        SetForegroundColor(Color::Magenta),
+        SetForegroundColor(Color::Rgb { r: 96, g: 165, b: 250 }),
         SetAttribute(Attribute::Bold),
-        Print(" ❯ "),
+        Print(" ❯  "),
         ResetColor
     )?;
     stdout.flush().context("failed to flush prompt")?;
@@ -208,6 +224,15 @@ fn read_input_line(suggester: &Suggester) -> Result<ReadOutcome> {
                         return Ok(ReadOutcome::TogglePermissionMode);
                     }
                     KeyCode::Char(character) => {
+                        if character == '\t' {
+                            if let Some(suggestion) = visible_suggestion(suggester, &input, suppress_suggestion) {
+                                input = suggestion;
+                                suppress_suggestion = false;
+                                render_input(&mut stdout, start_col, start_row, &input, None)?;
+                            }
+                            continue;
+                        }
+
                         input.push(character);
                         suppress_suggestion = false;
                         render_input(

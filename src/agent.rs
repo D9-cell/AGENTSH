@@ -1,13 +1,15 @@
 use std::time::Instant;
 
 use anyhow::{Context as AnyhowContext, Result};
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::blocks;
 use crate::config::Config;
 use crate::context::{Context, PermissionMode, Turn};
 use crate::llm::{ChatMessage, LlmClient};
-use crate::prompt_ui;
+use crate::parser;
+use crate::prompt_ui::{self, PermissionDecision};
 use crate::safety::RiskLevel;
 use crate::spinner::Spinner;
 use crate::tools::{self, PlannedCommand};
@@ -17,6 +19,16 @@ struct ExecutionResult {
     command: PlannedCommand,
     output: String,
     exit_code: Option<i32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ContentToolCall {
+    name: String,
+    #[serde(default)]
+    parameters: Value,
+    #[serde(default)]
+    arguments: Value,
+    command: Option<String>,
 }
 
 pub async fn handle(
@@ -39,8 +51,12 @@ pub async fn handle(
         }
     };
 
-    let Some(tool_calls) = plan_message.tool_calls.as_ref() else {
-        if let Some(content) = plan_message.content.as_deref() {
+    let tool_calls = if let Some(tool_calls) = plan_message.tool_calls.clone().filter(|calls| !calls.is_empty()) {
+        tool_calls
+    } else if let Some(content) = plan_message.content.as_deref() {
+        if let Some(fallback_calls) = fallback_tool_calls_from_content(content) {
+            fallback_calls
+        } else {
             prompt_ui::print_text(content);
             context.record_turn(Turn {
                 user_input: user_input.to_string(),
@@ -48,22 +64,11 @@ pub async fn handle(
                 executed: false,
                 explanation: content.to_string(),
             });
+            return Ok(());
         }
+    } else {
         return Ok(());
     };
-
-    if tool_calls.is_empty() {
-        if let Some(content) = plan_message.content.as_deref() {
-            prompt_ui::print_text(content);
-            context.record_turn(Turn {
-                user_input: user_input.to_string(),
-                planned_commands: Vec::new(),
-                executed: false,
-                explanation: content.to_string(),
-            });
-        }
-        return Ok(());
-    }
 
     let max_commands = config.agent.max_commands_per_turn.max(1);
     let selected_tool_calls = tool_calls.iter().take(max_commands).collect::<Vec<_>>();
@@ -75,22 +80,27 @@ pub async fn handle(
     }
 
     let planned_commands = build_planned_commands(&selected_tool_calls, context).await?;
-    let approved = should_auto_approve(config, &planned_commands)
-        || (!config.safety.require_confirm)
-        || prompt_ui::show_permission_panel(&planned_commands, &context.permission_mode);
-
-    if !approved {
-        prompt_ui::print_text("Cancelled.");
-        context.record_turn(Turn {
-            user_input: user_input.to_string(),
-            planned_commands: planned_commands
-                .iter()
-                .map(|command| command.display_text.clone())
-                .collect(),
-            executed: false,
-            explanation: "Cancelled.".to_string(),
-        });
-        return Ok(());
+    if !should_auto_approve(config, &planned_commands) && config.safety.require_confirm {
+        match prompt_ui::show_permission_panel(&planned_commands, &context.permission_mode) {
+            PermissionDecision::Approve => {}
+            PermissionDecision::EnableAutoApprove => {
+                context.permission_mode = PermissionMode::AutoApprove { countdown_secs: 2 };
+                prompt_ui::print_info("Full-permission mode enabled for this session.");
+            }
+            PermissionDecision::Cancel => {
+                prompt_ui::print_text("Cancelled.");
+                context.record_turn(Turn {
+                    user_input: user_input.to_string(),
+                    planned_commands: planned_commands
+                        .iter()
+                        .map(|command| command.display_text.clone())
+                        .collect(),
+                    executed: false,
+                    explanation: "Cancelled.".to_string(),
+                });
+                return Ok(());
+            }
+        }
     }
 
     let mut execution_results = Vec::new();
@@ -166,10 +176,10 @@ pub async fn handle(
             prompt_ui::show_explanation(&text);
             text
         }
-        Err(error) => {
-            let message = format!("[LLM error] {error}");
-            prompt_ui::print_text(&message);
-            message
+        Err(_) => {
+            let fallback = fallback_explanation(&execution_results);
+            prompt_ui::show_explanation(&fallback);
+            fallback
         }
     };
 
@@ -184,6 +194,140 @@ pub async fn handle(
     });
 
     Ok(())
+}
+
+fn fallback_tool_calls_from_content(content: &str) -> Option<Vec<crate::llm::ToolCall>> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        return fallback_tool_calls_from_json(value);
+    }
+
+    if matches!(parser::classify(trimmed), parser::InputKind::DirectCommand) {
+        return Some(vec![shell_tool_call(trimmed, 0)]);
+    }
+
+    None
+}
+
+fn fallback_tool_calls_from_json(value: Value) -> Option<Vec<crate::llm::ToolCall>> {
+    match value {
+        Value::Array(items) => {
+            let tool_calls = items
+                .into_iter()
+                .enumerate()
+                .map(|(index, item)| fallback_tool_call_from_value(item, index))
+                .collect::<Option<Vec<_>>>()?;
+            (!tool_calls.is_empty()).then_some(tool_calls)
+        }
+        other => fallback_tool_call_from_value(other, 0).map(|tool_call| vec![tool_call]),
+    }
+}
+
+fn fallback_tool_call_from_value(value: Value, index: usize) -> Option<crate::llm::ToolCall> {
+    let parsed = serde_json::from_value::<ContentToolCall>(value).ok()?;
+    let arguments = if !parsed.arguments.is_null() {
+        parsed.arguments
+    } else {
+        parsed.parameters
+    };
+
+    if matches!(parsed.name.as_str(), "bash_exec" | "file_read" | "file_write" | "git_status") {
+        return Some(crate::llm::ToolCall {
+            id: format!("fallback_call_{index}"),
+            function: crate::llm::FunctionCall {
+                name: parsed.name,
+                arguments: serde_json::to_string(&arguments).ok()?,
+            },
+        });
+    }
+
+    if let Some(command) = parsed.command.or_else(|| fallback_shell_command(&parsed.name, &arguments)) {
+        return Some(shell_tool_call(&command, index));
+    }
+
+    None
+}
+
+fn fallback_shell_command(name: &str, arguments: &Value) -> Option<String> {
+    match arguments {
+        Value::Null => Some(name.to_string()),
+        Value::Object(map) if map.is_empty() => Some(name.to_string()),
+        Value::Object(map) => map
+            .get("command")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        Value::String(command) => Some(command.clone()),
+        _ => None,
+    }
+}
+
+fn shell_tool_call(command: &str, index: usize) -> crate::llm::ToolCall {
+    crate::llm::ToolCall {
+        id: format!("fallback_shell_{index}"),
+        function: crate::llm::FunctionCall {
+            name: "bash_exec".to_string(),
+            arguments: serde_json::json!({ "command": command }).to_string(),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fallback_tool_calls_from_content;
+
+    #[test]
+    fn parses_shell_like_json_content_into_tool_call() {
+        let content = r#"{"name":"pwd","parameters":{}}"#;
+        let tool_calls = fallback_tool_calls_from_content(content).expect("fallback tool calls");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].function.name, "bash_exec");
+        assert!(tool_calls[0].function.arguments.contains("pwd"));
+    }
+
+    #[test]
+    fn parses_direct_command_content_into_tool_call() {
+        let tool_calls = fallback_tool_calls_from_content("pwd").expect("fallback tool calls");
+        assert_eq!(tool_calls[0].function.name, "bash_exec");
+        assert!(tool_calls[0].function.arguments.contains("pwd"));
+    }
+}
+
+fn fallback_explanation(results: &[ExecutionResult]) -> String {
+    if results.is_empty() {
+        return "No commands were executed.".to_string();
+    }
+
+    let total = results.len();
+    let failures = results
+        .iter()
+        .filter(|result| result.exit_code.unwrap_or(1) != 0)
+        .count();
+    let last = results.last().expect("results checked as non-empty");
+
+    if failures == 0 {
+        return format!(
+            "Completed {} command{}. The last step ran `{}` successfully.",
+            total,
+            if total == 1 { "" } else { "s" },
+            last.command.display_text,
+        );
+    }
+
+    format!(
+        "Ran {} command{}. {} step{} failed. The last command `{}` exited with {}.",
+        total,
+        if total == 1 { "" } else { "s" },
+        failures,
+        if failures == 1 { "" } else { "s" },
+        last.command.display_text,
+        last.exit_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "an unknown status".to_string()),
+    )
 }
 
 fn build_messages(user_input: &str, config: &Config, context: &Context) -> Vec<ChatMessage> {
